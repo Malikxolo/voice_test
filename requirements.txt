@@ -1,0 +1,17 @@
+# Core (required)
+python-dotenv>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+requests>=2.28.0
+
+# VAD (Voice Activity Detection)
+silero-vad>=5.1
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Install only the SDK for models you want to test:
+# pip install openai          # For OpenAI Whisper
+# pip install groq            # For Groq Whisper  
+# pip install assemblyai      # For AssemblyAI
+# pip install google-cloud-speech  # For Google Cloud
+# pip install faster-whisper  # For local Faster-Whisper
