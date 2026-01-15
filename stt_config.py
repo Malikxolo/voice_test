@@ -55,8 +55,9 @@ def transcribe_groq(audio_bytes: bytes, api_key: str, sample_rate: int = 16000) 
 
 
 def transcribe_deepgram(audio_bytes: bytes, api_key: str, sample_rate: int = 16000) -> str:
-    """Deepgram Nova-2 API"""
-    url = "https://api.deepgram.com/v1/listen?model=nova-2&language=en"
+    """Deepgram Nova-3 API with multi-language support"""
+    # Enable auto language detection for multi-language support (Hindi, English, etc.)
+    url = f"https://api.deepgram.com/v1/listen?model=nova-3&detect_language=true&encoding=linear16&sample_rate={sample_rate}&channels=1"
     headers = {
         "Authorization": f"Token {api_key}",
         "Content-Type": "audio/wav"
@@ -64,7 +65,68 @@ def transcribe_deepgram(audio_bytes: bytes, api_key: str, sample_rate: int = 160
     response = requests.post(url, headers=headers, data=audio_bytes)
     response.raise_for_status()
     result = response.json()
-    return result["results"]["channels"][0]["alternatives"][0]["transcript"]
+    
+    # Handle case where no transcription is returned
+    try:
+        transcript = result["results"]["channels"][0]["alternatives"][0]["transcript"]
+        return transcript if transcript else ""
+    except (KeyError, IndexError):
+        return ""
+
+
+def transcribe_sarvam_saarika(audio_bytes: bytes, api_key: str, sample_rate: int = 16000) -> str:
+    """Sarvam AI Saarika - Speech to Text (transcribes in original language with auto-detection)"""
+    url = "https://api.sarvam.ai/speech-to-text"
+    headers = {
+        "api-subscription-key": api_key
+    }
+    
+    # Create multipart form data with audio file
+    files = {
+        "file": ("audio.wav", io.BytesIO(audio_bytes), "audio/wav")
+    }
+    data = {
+        "model": "saarika:v2.5",
+        "language_code": "unknown"  # Auto-detect language (Hindi, English, etc.)
+    }
+    
+    response = requests.post(url, headers=headers, files=files, data=data)
+    response.raise_for_status()
+    result = response.json()
+    
+    # Extract transcript from response
+    try:
+        transcript = result.get("transcript", "")
+        return transcript if transcript else ""
+    except (KeyError, AttributeError):
+        return ""
+
+
+def transcribe_sarvam_saaras(audio_bytes: bytes, api_key: str, sample_rate: int = 16000) -> str:
+    """Sarvam AI Saaras - Speech to Text Translation (auto-detects language, translates to English)"""
+    url = "https://api.sarvam.ai/speech-to-text-translate"
+    headers = {
+        "api-subscription-key": api_key
+    }
+    
+    # Create multipart form data with audio file
+    files = {
+        "file": ("audio.wav", io.BytesIO(audio_bytes), "audio/wav")
+    }
+    data = {
+        "model": "saaras:v2.5"
+    }
+    
+    response = requests.post(url, headers=headers, files=files, data=data)
+    response.raise_for_status()
+    result = response.json()
+    
+    # Extract translated transcript from response
+    try:
+        transcript = result.get("transcript", "")
+        return transcript if transcript else ""
+    except (KeyError, AttributeError):
+        return ""
 
 
 def transcribe_assemblyai(audio_bytes: bytes, api_key: str, sample_rate: int = 16000) -> str:
@@ -196,7 +258,9 @@ def transcribe_faster_whisper(audio_bytes: bytes, api_key: str, sample_rate: int
 STT_MODELS = {
     "openai": ("OpenAI Whisper", "OPENAI_API_KEY", transcribe_openai),
     "groq": ("Groq Whisper", "GROQ_API_KEY", transcribe_groq),
-    "deepgram": ("Deepgram Nova-2", "DEEPGRAM_API_KEY", transcribe_deepgram),
+    "deepgram": ("Deepgram Nova-3", "DEEPGRAM_API_KEY", transcribe_deepgram),
+    "sarvam_saarika": ("Sarvam AI Saarika (Indian Languages)", "SARVAM_API_KEY", transcribe_sarvam_saarika),
+    "sarvam_saaras": ("Sarvam AI Saaras (Translate to English)", "SARVAM_API_KEY", transcribe_sarvam_saaras),
     "assemblyai": ("AssemblyAI", "ASSEMBLYAI_API_KEY", transcribe_assemblyai),
     "google": ("Google Cloud STT", "GOOGLE_CREDENTIALS_PATH", transcribe_google),
     "azure": ("Azure Speech", "AZURE_SPEECH_KEY", transcribe_azure),  # Format: key|region
