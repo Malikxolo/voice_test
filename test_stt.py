@@ -27,83 +27,107 @@ CHANNELS = 1
 
 # VAD settings from .env
 VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
-VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.25"))
-VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.3"))
+VAD_MIN_SPEECH_DURATION_MS = int(float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.25")) * 1000)
+VAD_MIN_SILENCE_DURATION_MS = int(float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.3")) * 1000)
+VAD_SPEECH_PAD_MS = int(os.getenv("VAD_SPEECH_PAD_MS", "300"))  # Padding to capture first words!
 
 
 class SileroVAD:
-    """Silero VAD wrapper for real-time speech detection."""
+    """Silero VAD wrapper using VADIterator for real-time speech detection with built-in padding."""
     
     def __init__(self, threshold: float = 0.5):
         self.threshold = threshold
         self.model = None
+        self.vad_iterator = None
         self._load_model()
     
     def _load_model(self):
-        """Load Silero VAD model."""
+        """Load Silero VAD model and create iterator."""
         try:
-            from silero_vad import load_silero_vad
+            from silero_vad import load_silero_vad, VADIterator
             self.model = load_silero_vad()
-            print("✅ Silero VAD loaded")
+            
+            # Use VADIterator with built-in speech_pad_ms for capturing first words!
+            self.vad_iterator = VADIterator(
+                model=self.model,
+                threshold=self.threshold,
+                sampling_rate=SAMPLE_RATE,
+                min_silence_duration_ms=VAD_MIN_SILENCE_DURATION_MS,
+                speech_pad_ms=VAD_SPEECH_PAD_MS,  # This prevents cutting first words!
+            )
+            print("✅ Silero VAD loaded (with VADIterator)")
+            print(f"   📊 speech_pad_ms={VAD_SPEECH_PAD_MS}ms (padding to capture first words)")
         except ImportError:
             print("⚠️  Silero VAD not installed. Install with: pip install silero-vad torch torchaudio")
             print("⚠️  Running without VAD (will transcribe everything)")
             self.model = None
+            self.vad_iterator = None
     
     def reset_states(self):
         """Reset VAD internal states."""
-        if self.model is not None:
+        if self.vad_iterator is not None:
+            self.vad_iterator.reset_states()
+        elif self.model is not None:
             self.model.reset_states()
     
-    def is_speech(self, audio_chunk: np.ndarray) -> bool:
+    def process_chunk(self, audio_chunk: np.ndarray):
         """
-        Check if audio chunk contains speech.
+        Process audio chunk through VADIterator.
         
         Args:
             audio_chunk: numpy array of int16 audio samples
             
         Returns:
-            True if speech detected, False otherwise
+            dict with 'start' or 'end' timestamp if speech boundary detected, None otherwise
         """
-        if self.model is None:
-            return True  # No VAD, assume all is speech
+        if self.vad_iterator is None:
+            return None
         
         import torch
         
         # Convert int16 to float32 normalized [-1, 1]
         audio_float = audio_chunk.astype(np.float32) / 32768.0
-        
-        # Convert to torch tensor
         audio_tensor = torch.from_numpy(audio_float)
         
-        # Get speech probability
-        speech_prob = self.model(audio_tensor, SAMPLE_RATE).item()
+        # VADIterator returns speech dict with 'start'/'end' timestamps or None
+        return self.vad_iterator(audio_tensor, return_seconds=False)
+    
+    def is_speech(self, audio_chunk: np.ndarray) -> bool:
+        """
+        Fallback: Check if audio chunk contains speech (for simple mode).
+        """
+        if self.model is None:
+            return True
         
+        import torch
+        audio_float = audio_chunk.astype(np.float32) / 32768.0
+        audio_tensor = torch.from_numpy(audio_float)
+        speech_prob = self.model(audio_tensor, SAMPLE_RATE).item()
         return speech_prob >= self.threshold
 
 
 class RealTimeTranscriber:
-    """Real-time speech transcription with VAD."""
+    """Real-time speech transcription with VAD using Silero's VADIterator."""
     
     def __init__(self, model_id: str):
         from stt_config import get_model
         
         self.name, self.api_key, self.transcribe_fn = get_model(model_id)
         
-        # Initialize VAD
+        # Initialize VAD with VADIterator (has built-in speech_pad_ms!)
         self.vad = SileroVAD(threshold=VAD_THRESHOLD)
         
-        # Audio buffer for accumulating speech
-        self.speech_buffer = []
+        # Audio buffer for accumulating ALL audio
+        self.audio_buffer = []
         self.is_speaking = False
-        self.silence_frames = 0
         
         # Frame settings (512 samples = 32ms at 16kHz, required by Silero)
         self.frame_size = 512
-        self.min_speech_frames = int(VAD_MIN_SPEECH_DURATION * SAMPLE_RATE / self.frame_size)
-        self.min_silence_frames = int(VAD_MIN_SILENCE_DURATION * SAMPLE_RATE / self.frame_size)
         
-        self.speech_frames_count = 0
+        # Track buffer offset when we clear old audio
+        self.buffer_offset = 0
+        self.speech_start_sample = None
+        
         self.running = False
     
     def _audio_to_wav_bytes(self, audio_data: np.ndarray) -> bytes:
@@ -117,43 +141,50 @@ class RealTimeTranscriber:
         return wav_buffer.getvalue()
     
     def _process_frame(self, frame: np.ndarray):
-        """Process a single audio frame with VAD."""
-        is_speech = self.vad.is_speech(frame)
+        """Process a single audio frame with VADIterator."""
+        # Accumulate all audio
+        self.audio_buffer.append(frame)
         
-        if is_speech:
-            self.speech_frames_count += 1
-            self.silence_frames = 0
-            
-            # Start accumulating speech
-            if not self.is_speaking and self.speech_frames_count >= self.min_speech_frames:
+        # Use VADIterator to detect speech boundaries (with built-in padding!)
+        result = self.vad.process_chunk(frame)
+        
+        if result is not None:
+            if 'start' in result:
+                # Speech started (timestamp already includes speech_pad_ms padding!)
                 self.is_speaking = True
+                # Adjust for buffer offset
+                self.speech_start_sample = result['start'] - self.buffer_offset
                 print("🎤 ", end="", flush=True)
             
-            if self.is_speaking:
-                self.speech_buffer.append(frame)
-        
-        else:
-            self.speech_frames_count = 0
-            
-            if self.is_speaking:
-                self.silence_frames += 1
-                self.speech_buffer.append(frame)  # Include trailing silence
+            elif 'end' in result:
+                # Speech ended - extract and transcribe
+                speech_end_sample = result['end'] - self.buffer_offset
+                self._transcribe_segment(self.speech_start_sample, speech_end_sample)
+                self.is_speaking = False
+                self.speech_start_sample = None
                 
-                # End of speech detected
-                if self.silence_frames >= self.min_silence_frames:
-                    self._transcribe_buffer()
-                    self.is_speaking = False
-                    self.speech_buffer = []
-                    self.silence_frames = 0
-                    self.vad.reset_states()
+                # Reset VADIterator to start fresh for next speech
+                # This resets the internal sample counter
+                self.vad.reset_states()
+                
+                # Clear audio buffer and reset offset tracking
+                self.audio_buffer = []
+                self.buffer_offset = 0
     
-    def _transcribe_buffer(self):
-        """Transcribe accumulated speech buffer."""
-        if not self.speech_buffer:
+    def _transcribe_segment(self, start_sample: int, end_sample: int):
+        """Transcribe a speech segment by sample indices."""
+        # Flatten audio buffer
+        all_audio = np.concatenate(self.audio_buffer)
+        
+        # Extract segment (clamp to valid range)
+        start_idx = max(0, start_sample)
+        end_idx = min(len(all_audio), end_sample)
+        
+        if end_idx <= start_idx:
+            print("→ (empty segment)")
             return
         
-        # Combine all speech frames
-        audio_data = np.concatenate(self.speech_buffer, axis=0)
+        audio_data = all_audio[start_idx:end_idx]
         wav_bytes = self._audio_to_wav_bytes(audio_data)
         
         duration = len(audio_data) / SAMPLE_RATE
@@ -168,6 +199,8 @@ class RealTimeTranscriber:
         except Exception as e:
             print(f"→ ❌ {str(e)[:50]}")
     
+
+    
     def start(self):
         """Start real-time transcription."""
         import sounddevice as sd
@@ -176,7 +209,7 @@ class RealTimeTranscriber:
         print(f"🎙️  REAL-TIME STT: {self.name}")
         print(f"{'=' * 60}")
         print(f"📊 VAD Threshold: {VAD_THRESHOLD}")
-        print(f"📊 Min Speech: {VAD_MIN_SPEECH_DURATION}s | Min Silence: {VAD_MIN_SILENCE_DURATION}s")
+        print(f"📊 Min Silence: {VAD_MIN_SILENCE_DURATION_MS}ms | Speech Pad: {VAD_SPEECH_PAD_MS}ms")
         print(f"{'─' * 60}")
         print("🔴 Listening... (Ctrl+C to stop)\n")
         
